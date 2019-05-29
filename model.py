@@ -31,7 +31,7 @@ class ConditionalResidual1dBlock(nn.Module):
                 relu=nn.ReLU(),
                 conv1d=nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False)
             )),
-            second_linear_block=nn.ModuleDict(dict(
+            second_conv_block=nn.ModuleDict(dict(
                 conditional_batch_norm1d=ConditionalBatchNorm1d(condition_channels, out_channels),
                 relu=nn.ReLU(),
                 conv1d=nn.Conv1d(out_channels, out_channels, kernel_size=1, bias=False)
@@ -45,17 +45,17 @@ class ConditionalResidual1dBlock(nn.Module):
 
         shortcut = inputs
 
-        inputs = self.module_dict.first_linear_block.conditional_batch_norm1d(inputs, conditions)
-        inputs = self.module_dict.first_linear_block.relu(inputs)
+        inputs = self.module_dict.first_conv_block.conditional_batch_norm1d(inputs, conditions)
+        inputs = self.module_dict.first_conv_block.relu(inputs)
 
         if self.module_dict.projection_block:
             shortcut = self.module_dict.projection_block.conv1d(inputs)
 
-        inputs = self.module_dict.first_linear_block.conv1d(inputs)
+        inputs = self.module_dict.first_conv_block.conv1d(inputs)
 
-        inputs = self.module_dict.second_linear_block.conditional_batch_norm1d(inputs, conditions)
-        inputs = self.module_dict.second_linear_block.relu(inputs)
-        inputs = self.module_dict.second_linear_block.conv1d(inputs)
+        inputs = self.module_dict.second_conv_block.conditional_batch_norm1d(inputs, conditions)
+        inputs = self.module_dict.second_conv_block.relu(inputs)
+        inputs = self.module_dict.second_conv_block.conv1d(inputs)
 
         inputs = inputs + shortcut
 
@@ -89,12 +89,9 @@ class ConditionalResidualDecoder(nn.Module):
             )
         ))
 
-    def forward(self, positions, latents, conditions):
+    def forward(self, positions, conditions):
 
         inputs = self.module_dict.position_conv1d_block(positions)
-
-        if latents is not None:
-            inputs = inputs + self.module_dict.latent_conv1d_block(latents)
 
         for conditional_residual1d_block in self.module_dict.conditional_residual1d_blocks:
             inputs = conditional_residual1d_block(inputs, conditions)

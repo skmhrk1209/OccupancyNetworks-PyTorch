@@ -3,11 +3,11 @@ from torch import nn
 from torch import distributed
 from torch import optim
 from torch import utils
-from torchvision import datasets
-from torchvision import transforms
 from torchvision import models
 from tensorboardX import SummaryWriter
 from model import *
+from dataset import *
+from sampler import *
 import numpy as np
 import argparse
 import json
@@ -28,6 +28,17 @@ class Dict(dict):
     def __getattr__(self, name): return self[name]
     def __setattr__(self, name, value): self[name] = value
     def __delattr__(self, name): del self[name]
+
+
+def sum_gradients(model):
+    for param in model.parameters():
+        if param.requires_grad:
+            distributed.all_reduce(param.grad)
+
+
+def broadcast_buffers(model):
+    for buffer in model.buffers():
+        distributed.broadcast(buffer, 0)
 
 
 def main():
@@ -56,7 +67,25 @@ def main():
 
     encoder = models.resnet18(pretrained=True).cuda()
     decoder = ConditionalResidualDecoder(
-        1, 2, 3, 4
+        position_conv_param=Dict(
+            in_channels=3,
+            out_channels=256
+        ),
+        latent_conv_param=Dict(
+            in_channels=256,
+            out_channels=256
+        ),
+        conditional_residual_params=[
+            Dict(
+                in_channels=256,
+                out_channels=256,
+                condition_channels=256
+            ) for _ in range(5)
+        ],
+        conv_param=Dict(
+            in_channels=256,
+            out_channels=1
+        )
     ).cuda()
 
     criterion = nn.CrossEntropyLoss(reduction='mean').cuda()
@@ -92,34 +121,16 @@ def main():
 
     if config.training:
 
-        train_dataset = ImageDataset(
+        train_dataset = OccupancyDataset(
             root=config.train_root,
-            meta=config.train_meta,
-            transform=transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.485, 0.456, 0.406),
-                    std=(0.229, 0.224, 0.225)
-                ),
-            ]),
-            memcached=False
+            mode='train',
+            num_samples=config.num_samples
         )
 
-        val_dataset = ImageDataset(
+        val_dataset = OccupancyDataset(
             root=config.val_root,
-            meta=config.val_meta,
-            transform=transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.485, 0.456, 0.406),
-                    std=(0.229, 0.224, 0.225)
-                ),
-            ]),
-            memcached=False
+            mode='val',
+            num_samples=config.num_samples
         )
 
         train_sampler = DistributedSampler(
@@ -157,11 +168,6 @@ def main():
             pin_memory=True
         )
 
-        def sum_gradients(model):
-            for param in model.parameters():
-                if param.requires_grad:
-                    distributed.all_reduce(param.grad)
-
         training_begin = time.time()
 
         for epoch in range(last_epoch + 1, config.num_epochs):
@@ -169,19 +175,22 @@ def main():
             encoder.train()
             decoder.train()
 
-            for local_step, (images, labels) in enumerate(train_data_loader):
+            for local_step, (positions, occupancies, images) in enumerate(train_data_loader):
 
                 step_begin = time.time()
 
+                positions = positions.cuda()
+                occupancies = occupancies.cuda()
                 images = images.cuda()
-                labels = labels.cuda()
 
-                logits = model(images)
-                loss = criterion(logits, labels) / config.world_size
+                conditions = encoder(images)
+                logits = decoder(positions, conditions)
+                loss = criterion(logits, occupancies) / config.world_size
 
                 optimizer.zero_grad()
                 loss.backward()
-                sum_gradients(model)
+                sum_gradients(encoder)
+                sum_gradients(decoder)
                 optimizer.step()
 
                 predictions = logits.topk(1)[1].squeeze()
@@ -209,21 +218,21 @@ def main():
                 global_step += 1
 
             torch.save(dict(
-                model_state_dict=model.state_dict(),
+                encoder_state_dict=encoder.state_dict(),
+                decoder_state_dict=decoder.state_dict(),
                 optimizer_state_dict=optimizer.state_dict(),
                 last_epoch=last_epoch,
                 global_step=global_step
             ), f'{config.checkpoint_directory}/epoch_{epoch}')
 
-            lr_scheduler.step()
-
             if config.validation:
 
-                model.eval()
+                encoder.eval()
+                decoder.eval()
 
                 # batch norm statistics are different on each device
-                for buffer in model.buffers():
-                    distributed.broadcast(buffer, 0)
+                broadcast_buffers(encoder)
+                broadcast_buffers(decoder)
 
                 with torch.no_grad():
 
@@ -232,11 +241,13 @@ def main():
 
                     for local_step, (images, labels) in enumerate(val_data_loader):
 
+                        positions = positions.cuda()
+                        occupancies = occupancies.cuda()
                         images = images.cuda()
-                        labels = labels.cuda()
 
-                        logits = model(images)
-                        loss = criterion(logits, labels) / config.world_size
+                        conditions = encoder(images)
+                        logits = decoder(positions, conditions)
+                        loss = criterion(logits, occupancies) / config.world_size
 
                         predictions = logits.topk(1)[1].squeeze()
                         accuracy = torch.mean((predictions == labels).float()) / config.world_size
@@ -266,70 +277,6 @@ def main():
         training_end = time.time()
         if config.global_rank == 0:
             print(f'training finished [{training_end - training_begin:.4f}s]')
-
-    elif config.validation:
-
-        val_dataset = ImageDataset(
-            root=config.val_root,
-            meta=config.val_meta,
-            transform=transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.485, 0.456, 0.406),
-                    std=(0.229, 0.224, 0.225)
-                ),
-            ]),
-            memcached=False
-        )
-
-        val_sampler = DistributedSampler(
-            dataset=val_dataset,
-            shuffle=False
-        )
-
-        val_data_loader = utils.data.DataLoader(
-            dataset=val_dataset,
-            batch_size=config.local_batch_size,
-            sampler=val_sampler,
-            num_workers=config.num_workers,
-            pin_memory=True
-        )
-
-        model.eval()
-
-        # batch norm statistics are different on each device
-        for buffer in model.buffers():
-            distributed.broadcast(buffer, 0)
-
-        with torch.no_grad():
-
-            average_loss = 0
-            average_accurtacy = 0
-
-            for local_step, (images, labels) in enumerate(val_data_loader):
-
-                images = images.cuda()
-                labels = labels.cuda()
-
-                logits = model(images)
-                loss = criterion(logits, labels) / config.world_size
-
-                predictions = logits.topk(1)[1].squeeze()
-                accuracy = torch.mean((predictions == labels).float()) / config.world_size
-
-                distributed.all_reduce(loss)
-                distributed.all_reduce(accuracy)
-
-                average_loss += loss
-                average_accurtacy += accuracy
-
-            average_loss /= (local_step + 1)
-            average_accurtacy /= (local_step + 1)
-
-            if config.global_rank == 0:
-                print(f'[validation] epoch: {epoch} loss: {average_loss:.4f} accuracy: {average_accurtacy:.4f}')
 
     if config.global_rank == 0:
         summary_writer.close()

@@ -1,0 +1,20 @@
+{
+    "num_workers": 4,
+    "num_epochs": 90,
+    "lr": 0.1,
+    "lr_milestones": [
+        30,
+        60,
+        80
+    ],
+    "lr_gamma": 0.1,
+    "momentum": 0.9,
+    "local_batch_size": 32,
+    "batch_milestones": [],
+    "batch_gamma": 10.0,
+    "weight_decay": 0.0001,
+    "checkpoint_directory": "/mnt/lustre/sensetime/hiroki_sakuma/OccupancyNetworks/checkpoints/decaying_learning_rate_0",
+    "event_directory": "/mnt/lustre/sensetime/hiroki_sakuma/OccupancyNetworks/events/decaying_learning_rate_0",
+    "train_root": "/mnt/lustre/sensetime/hiroki_sakuma/OccupancyNetworks/data",
+    "val_root": "/mnt/lustre/sensetime/hiroki_sakuma/OccupancyNetworks/data"
+}
